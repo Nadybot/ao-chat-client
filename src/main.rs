@@ -3,21 +3,18 @@
     clippy::let_underscore_drop,
     clippy::cast_possible_truncation,
     clippy::too_many_lines,
-    clippy::module_name_repetitions,
+    clippy::module_name_repetitions
 )]
 
-use chat::ChatState;
+use chat::{ChannelType, ResolvedChannel};
 use directories::ProjectDirs;
 use futures_util::StreamExt;
-use nadylib::{
-    models::{Channel, Message},
-    packets::{GroupMessagePacket, MsgPrivatePacket, PrivgrpMessagePacket},
-    AOSocket, SocketConfig,
-};
-use tokio::sync::mpsc::unbounded_channel;
+use nadylib::{AOSocket, SocketConfig};
+use tokio::sync::{mpsc::unbounded_channel, oneshot};
 use tui::{
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
+    text::Text,
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
@@ -25,6 +22,8 @@ use std::{
     fs::{create_dir_all, write},
     io,
 };
+
+use crate::chat::{Command, StateQuery, UiUpdate};
 
 mod chat;
 mod command;
@@ -35,19 +34,23 @@ mod util;
 
 const ORANGE: Color = Color::Rgb(232, 149, 6);
 
+#[derive(PartialEq, Eq)]
 enum InputMode {
     Command,
     Chat,
+    Scroll,
 }
 
-struct App {
+struct App<'a> {
     current_mode: InputMode,
     channel_switcher_open: bool,
     channel_switcher_state: ListState,
-    current_channel: Channel,
+    channel_switcher_channels: Vec<ResolvedChannel>,
+    current_channel: ResolvedChannel,
     input_text: String,
     status_text: String,
-    chat_state: ChatState,
+    messages: Text<'a>,
+    scroll_y: usize,
 }
 
 #[tokio::main]
@@ -82,21 +85,30 @@ async fn main() -> io::Result<()> {
     let sock = AOSocket::connect("chat.d1.funcom.com:7105", SocketConfig::default())
         .await
         .unwrap();
-    let sender = sock.get_sender();
     let mut app = App {
         current_mode: InputMode::Command,
-        channel_switcher_open: true,
+        channel_switcher_open: false,
         channel_switcher_state: ListState::default(),
-        current_channel: Channel::Vicinity,
+        channel_switcher_channels: Vec::new(),
+        current_channel: ResolvedChannel {
+            id: 0,
+            name: String::from("Vicinity"),
+            r#type: ChannelType::Vicinity,
+        },
         input_text: String::new(),
         status_text: String::from("Initialized"),
-        chat_state: ChatState::with_sender(sender),
+        messages: Text::raw(""),
+        scroll_y: 0,
     };
 
-    let (state_sender, mut receiver) = unbounded_channel();
+    let (state_query_sender, state_query_receiver) = unbounded_channel();
+    let (command_sender, command_receiver) = unbounded_channel();
+    let (ui_update_sender, mut ui_update_receiver) = unbounded_channel();
     tokio::spawn(chat::chat_task(
         sock,
-        state_sender,
+        state_query_receiver,
+        command_receiver,
+        ui_update_sender,
         config.user_name.clone(),
         config.character_name.clone(),
         config.password.clone(),
@@ -127,15 +139,10 @@ async fn main() -> io::Result<()> {
             );
             f.render_widget(block, size);
 
-            // Chat block is empty
-            let chat_block = List::new(
-                app.chat_state
-                    .messages
-                    .iter()
-                    .map(|m| ListItem::new(app.chat_state.render_message(m)))
-                    .collect::<Vec<ListItem>>(),
-            )
-            .block(Block::default());
+            let chat_block = Paragraph::new(app.messages.clone())
+                .scroll((app.scroll_y as u16, 0))
+                .wrap(Wrap { trim: false })
+                .block(Block::default());
             f.render_widget(chat_block, chunks[0]);
 
             // Status bar
@@ -146,6 +153,10 @@ async fn main() -> io::Result<()> {
                         .alignment(Alignment::Left)
                         .wrap(Wrap { trim: true })
                 }
+                InputMode::Scroll => Paragraph::new(format!("[Mode: Scroll] {}", app.status_text))
+                    .block(Block::default().style(Style::default().bg(Color::Red).fg(Color::White)))
+                    .alignment(Alignment::Left)
+                    .wrap(Wrap { trim: true }),
                 InputMode::Chat => Paragraph::new(format!("[Mode: Chat] {}", app.status_text))
                     .block(
                         Block::default().style(Style::default().bg(Color::Blue).fg(Color::White)),
@@ -162,8 +173,7 @@ async fn main() -> io::Result<()> {
             let input_paragraph = Paragraph::new(app.input_text.as_str());
 
             if let InputMode::Chat = app.current_mode {
-                let channel_text =
-                    format!("[{}]", app.chat_state.render_channel(&app.current_channel));
+                let channel_text = format!("[{}]", app.current_channel.render());
 
                 let input_bar_layout = Layout::default()
                     .direction(Direction::Horizontal)
@@ -194,17 +204,16 @@ async fn main() -> io::Result<()> {
             }
 
             if app.channel_switcher_open {
-                if !app.chat_state.channels.is_empty()
+                if !app.channel_switcher_channels.is_empty()
                     && app.channel_switcher_state.selected().is_none()
                 {
                     app.channel_switcher_state.select(Some(0));
                 }
 
                 let popup = List::new(
-                    app.chat_state
-                        .channels
+                    app.channel_switcher_channels
                         .iter()
-                        .map(|c| ListItem::new(app.chat_state.render_channel(c)))
+                        .map(|c| ListItem::new(c.render()))
                         .collect::<Vec<ListItem>>(),
                 )
                 .block(
@@ -237,7 +246,7 @@ async fn main() -> io::Result<()> {
                                 let i = match app.channel_switcher_state.selected() {
                                     Some(i) => {
                                         if i == 0 {
-                                            app.chat_state.channels.len() - 1
+                                            app.channel_switcher_channels.len() - 1
                                         } else {
                                             i - 1
                                         }
@@ -249,7 +258,7 @@ async fn main() -> io::Result<()> {
                             input::KeyEvent { code: input::KeyCode::Down, ..} if app.channel_switcher_open => {
                                 let i = match app.channel_switcher_state.selected() {
                                     Some(i) => {
-                                        if i >= app.chat_state.channels.len() - 1 {
+                                        if i >= app.channel_switcher_channels.len() - 1 {
                                             0
                                         } else {
                                             i + 1
@@ -261,42 +270,21 @@ async fn main() -> io::Result<()> {
                             }
                             input::KeyEvent { code: input::KeyCode::Enter, .. } => {
                                 if app.channel_switcher_open {
-                                    app.current_channel = app.chat_state.channels[app.channel_switcher_state.selected().unwrap()].clone();
+                                    app.current_channel = app.channel_switcher_channels[app.channel_switcher_state.selected().unwrap()].clone();
                                     app.channel_switcher_open = false;
-                                } else if let InputMode::Chat = app.current_mode {
+                                    app.current_mode = InputMode::Chat;
+                                } else if InputMode::Chat == app.current_mode {
                                     let text = app.input_text.clone();
                                     app.input_text.clear();
 
-                                    let message = Message {
-                                        sender: Some(app.chat_state.current_user),
-                                        channel: app.current_channel.clone(),
-                                        text,
-                                        send_tag: String::from("\u{0}"),
-                                    };
-
-                                    match app.current_channel {
-                                        Channel::Group(_) => { let _ = app.chat_state.sender.send(GroupMessagePacket { message }).await; },
-                                        Channel::Tell(_) => { let _ = app.chat_state.sender.send(MsgPrivatePacket { message }).await; },
-                                        Channel::PrivateChannel(_) => { let _ = app.chat_state.sender.send(PrivgrpMessagePacket { message }).await; },
-                                        Channel::Vicinity => panic!("Shouldn't happen"),
-                                    };
-                                } else if let InputMode::Command = app.current_mode {
+                                    let _ = command_sender.send(Command::Message(app.current_channel.clone(), text));
+                                } else if InputMode::Command == app.current_mode {
                                     let command = command::Command::from_input(&app.input_text);
                                     app.input_text.clear();
 
                                     if let Some(cmd) = command {
-                                        match cmd {
-                                            command::Command::Kick(user) => {},
-                                            command::Command::Invite(user) => {},
-                                            command::Command::Leave(user) => {},
-                                            command::Command::Tell(user, maybe_text) => {
-                                                if let Some(text) = maybe_text {
-                                                    app.chat_state.send_tell(&user, text).await;
-                                                } else {
-                                                    app.chat_state.lookup_user(&user).await;
-                                                }
-                                            }
-                                        }
+                                        let cmd = cmd.into();
+                                        let _ = command_sender.send(cmd);
                                     } else {
                                         app.status_text = String::from("Error in command syntax");
                                     }
@@ -304,15 +292,29 @@ async fn main() -> io::Result<()> {
                             }
                             input::KeyEvent { code: input::KeyCode::Esc, .. } => {
                                 app.input_text.clear();
-                                if let InputMode::Command = app.current_mode {
+                                if InputMode::Command == app.current_mode {
                                     app.current_mode = InputMode::Chat;
                                 } else {
                                     app.current_mode = InputMode::Command;
                                     app.input_text.push('/');
                                 }
                             },
-                            input::KeyEvent { code: input::KeyCode::Tab, .. } => app.channel_switcher_open = !app.channel_switcher_open,
-                            input::KeyEvent { code: input::KeyCode::Char('k'), modifiers } if modifiers.contains(input::KeyModifiers::CONTROL) => app.channel_switcher_open = !app.channel_switcher_open,
+                            input::KeyEvent { code: input::KeyCode::Tab, .. } => {
+                                app.channel_switcher_open = !app.channel_switcher_open;
+                                let (tx, rx) = oneshot::channel();
+                                let query = StateQuery::Channels(tx);
+                                let _ = state_query_sender.send(query);
+                                let channels = rx.await.unwrap();
+                                app.channel_switcher_channels = channels;
+                            },
+                            input::KeyEvent { code: input::KeyCode::Char('k'), modifiers } if modifiers.contains(input::KeyModifiers::CONTROL) => {
+                                app.channel_switcher_open = !app.channel_switcher_open;
+                                let (tx, rx) = oneshot::channel();
+                                let query = StateQuery::Channels(tx);
+                                let _ = state_query_sender.send(query);
+                                let channels = rx.await.unwrap();
+                                app.channel_switcher_channels = channels;
+                            },
                             input::KeyEvent { code: input::KeyCode::Char(c), .. } => app.input_text.push(c),
                             _ => {},
                         }
@@ -320,13 +322,23 @@ async fn main() -> io::Result<()> {
                 } else {
                     break;
                 }
-            }
+            },
 
-            state_update = receiver.recv() => {
-                if let Some(update) = state_update {
-                    app.chat_state.handle_update(update);
+            ui_update = ui_update_receiver.recv() => {
+                if let Some(update) = ui_update {
+                    match update {
+                        UiUpdate::Message(msg) => {
+                            let rendered = msg.render();
+                            app.messages.lines.splice(0..0, rendered);
+
+                            if app.current_mode != InputMode::Scroll {
+                                app.scroll_y = 0;
+                            }
+                        },
+                        _ => {},
+                    }
                 }
-            }
+            },
         };
     }
 
