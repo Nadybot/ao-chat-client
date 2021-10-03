@@ -8,10 +8,10 @@ edition = "2018"
 [dependencies]
 bimap = "0.6"
 crossterm = { version = "0.20", features = ["event-stream"] }
-directories = "3.0"
+directories = "4.0"
 futures-util = { version = "0.3", default-features = false }
-nadylib = { git = "https://github.com/Nadybot/nadylib.git", default-features = false }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+nadylib = { git = "https://github.com/Nadybot/nadylib.git", branch = "unstable", default-features = false, features = ["async"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 tui = { version = "0.16", default-features = false, features = ["crossterm"] }
 
 [profile.release]
